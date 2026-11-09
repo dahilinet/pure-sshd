@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# pure-sshd — paket agaci {start|stop|restart|status|user_add|user_dell}
+set -euo pipefail
+self_path="$(readlink -f "$0")"
+etc_dir="$(dirname "$(dirname "$self_path")")"
+kok="$(dirname "$etc_dir")"
+bin="$kok/bin/pure-sshd"
+conf="$etc_dir/pure-sshd.conf"
+pid_file="$kok/var/run/pure-sshd.pid"
+lock_file="$kok/var/run/pure-sshd.lock"
+log_file="$kok/var/log/pure-sshd.log"
+db_file="$kok/var/db/master.db"
+hapis_kok="/opt/hosting/clients/"
+
+usage() {
+	printf '%s\n' "kullanim: $0 {start|stop|restart|status|user_add|user_dell}"
+	printf '%s\n' "  user_add  <username> <home> [fqdn] [client_kod]"
+	printf '%s\n' "  user_dell <username>"
+}
+
+fnc_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		printf '%s\n' "root gerekli" >&2
+		exit 1
+	fi
+}
+
+fnc_pid_calisiyor() {
+	[ -f "$pid_file" ] || return 1
+	local p
+	p="$(tr -d ' \n' <"$pid_file")"
+	[ -n "$p" ] || return 1
+	kill -0 "$p" 2>/dev/null
+}
+
+fnc_pid_al() {
+	if fnc_pid_calisiyor; then
+		tr -d ' \n' <"$pid_file"
+		return 0
+	fi
+	pgrep -n -x pure-sshd 2>/dev/null || true
+}
+
+fnc_sql_kacis() {
+	printf '%s' "${1-}" | sed "s/'/''/g"
+}
+
+fnc_user_ok() {
+	local u="${1-}"
+	if [ -z "$u" ] || [ "$u" = "root" ] || [ "${#u}" -gt 64 ]; then
+		return 1
+	fi
+	case "$u" in
+	*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+	return 0
+}
+
+cmd_start() {
+	fnc_root
+	mkdir -p "$kok/var/run" "$kok/var/log" "$kok/var/db"
+	[ -x "$bin" ] || { printf '%s\n' "binary yok: $bin" >&2; exit 1; }
+	[ -f "$conf" ] || { printf '%s\n' "conf yok: $conf" >&2; exit 1; }
+	exec 9>"$lock_file"
+	if ! flock -n 9; then
+		printf '%s\n' "pure-sshd kilitli ($lock_file)"
+		return 0
+	fi
+	if fnc_pid_calisiyor || pgrep -x pure-sshd >/dev/null 2>&1; then
+		local cur
+		cur="$(fnc_pid_al)"
+		if [ -n "$cur" ] && [ ! -f "$pid_file" ]; then
+			printf '%s\n' "$cur" >"$pid_file"
+		fi
+		printf '%s\n' "pure-sshd zaten calisiyor"
+		return 0
+	fi
+	: >>"$log_file"
+	rm -f "$pid_file"
+	nohup "$bin" -c "$conf" >>"$log_file" 2>&1 9>&- &
+	echo $! >"$pid_file"
+	sleep 0.4
+	if fnc_pid_calisiyor; then
+		printf '%s\n' "pure-sshd start OK pid=$(tr -d ' \n' <"$pid_file") :22"
+		return 0
+	fi
+	printf '%s\n' "pure-sshd start basarisiz" >&2
+	tail -n 30 "$log_file" >&2 || true
+	exit 1
+}
+
+cmd_stop() {
+	fnc_root
+	if fnc_pid_calisiyor; then
+		local p
+		p="$(tr -d ' \n' <"$pid_file")"
+		kill "$p" || true
+		sleep 0.3
+		if kill -0 "$p" 2>/dev/null; then
+			kill -9 "$p" || true
+		fi
+	fi
+	rm -f "$pid_file" "$lock_file"
+	printf '%s\n' "pure-sshd: stopped"
+}
+
+cmd_status() {
+	if fnc_pid_calisiyor || pgrep -x pure-sshd >/dev/null 2>&1; then
+		printf 'pure-sshd: running  pid=%s  :22\n' "$(fnc_pid_al)"
+	else
+		printf 'pure-sshd: stopped\n'
+	fi
+	printf 'cnf: %s\n' "$conf"
+	printf 'pid: %s\n' "$pid_file"
+	printf 'lock: %s\n' "$lock_file"
+	printf 'log: %s\n' "$log_file"
+	printf 'db: %s\n' "$db_file"
+}
+
+cmd_user_add() {
+	fnc_root
+	local strUser="${1-}" strHome="${2-}" strFqdn="${3-}" strKod="${4-}"
+	if [ -z "$strUser" ] || [ -z "$strHome" ]; then
+		printf '%s\n' "kullanim: $0 user_add <username> <home> [fqdn] [client_kod]" >&2
+		exit 1
+	fi
+	if ! fnc_user_ok "$strUser"; then
+		printf '%s\n' "username gecersiz (harf/rakam/_/- , root yok, max 64)" >&2
+		exit 1
+	fi
+	strHome="$(readlink -f "$strHome" 2>/dev/null || printf '%s' "$strHome")"
+	case "$strHome" in
+	"${hapis_kok}"*) ;;
+	*)
+		printf '%s\n' "home hapis disi (gerek: ${hapis_kok}...)" >&2
+		exit 1
+		;;
+	esac
+	if [ ! -d "$strHome" ]; then
+		printf '%s\n' "home dizin yok: $strHome" >&2
+		exit 1
+	fi
+	if [ -z "$strFqdn" ]; then
+		strFqdn="${strUser//_/.}"
+	fi
+	command -v sqlite3 >/dev/null 2>&1 || { printf '%s\n' "sqlite3 yok" >&2; exit 1; }
+	command -v openssl >/dev/null 2>&1 || { printf '%s\n' "openssl yok" >&2; exit 1; }
+	mkdir -p "$(dirname "$db_file")"
+	[ -f "$db_file" ] || sqlite3 "$db_file" <"$kok/sql/ssh_users.sql"
+	local n strLow strU strH strHm strF strK strOn strDuz strHash
+	strLow="$(printf '%s' "$strUser" | tr '[:upper:]' '[:lower:]')"
+	strLow="$(fnc_sql_kacis "$strLow")"
+	n="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM ssh_users WHERE lower(username)='$strLow';")"
+	if [ "${n:-0}" != "0" ]; then
+		printf '%s\n' "user var: $strUser" >&2
+		exit 1
+	fi
+	if [ -t 0 ]; then
+		printf 'sifre: ' >&2
+		stty -echo
+		IFS= read -r strDuz || true
+		stty echo
+		printf '\n' >&2
+	else
+		IFS= read -r strDuz || true
+	fi
+	if [ -z "$strDuz" ]; then
+		printf '%s\n' "sifre bos" >&2
+		exit 1
+	fi
+	strHash="$(printf '%s\n' "$strDuz" | openssl passwd -6 -stdin)"
+	strDuz=""
+	strOn='{SHA512-CRYPT}'
+	strU="$(fnc_sql_kacis "$strUser")"
+	strH="$(fnc_sql_kacis "$strHash")"
+	strHm="$(fnc_sql_kacis "$strHome")"
+	strF="$(fnc_sql_kacis "$strFqdn")"
+	strK="$(fnc_sql_kacis "$strKod")"
+	sqlite3 "$db_file" "INSERT INTO ssh_users (username, password, home, fqdn, client_kod, sifre_acik, anahtar_acik, active) VALUES ('$strU','$strOn$strH','$strHm','$strF','$strK',1,0,1);"
+	printf '%s\n' "user_add ok $strUser home=$strHome"
+}
+
+cmd_user_dell() {
+	fnc_root
+	local strUser="${1-}"
+	if [ -z "$strUser" ]; then
+		printf '%s\n' "kullanim: $0 user_dell <username>" >&2
+		exit 1
+	fi
+	if ! fnc_user_ok "$strUser"; then
+		printf '%s\n' "username gecersiz" >&2
+		exit 1
+	fi
+	command -v sqlite3 >/dev/null 2>&1 || { printf '%s\n' "sqlite3 yok" >&2; exit 1; }
+	[ -f "$db_file" ] || { printf '%s\n' "db yok: $db_file" >&2; exit 1; }
+	local n strLow
+	strLow="$(printf '%s' "$strUser" | tr '[:upper:]' '[:lower:]')"
+	strLow="$(fnc_sql_kacis "$strLow")"
+	n="$(sqlite3 "$db_file" "SELECT COUNT(*) FROM ssh_users WHERE lower(username)='$strLow';")"
+	if [ "${n:-0}" = "0" ]; then
+		printf '%s\n' "user yok: $strUser" >&2
+		exit 1
+	fi
+	sqlite3 "$db_file" "DELETE FROM ssh_users WHERE lower(username)='$strLow';"
+	printf '%s\n' "user_dell ok $strUser"
+}
+
+case "${1:-}" in
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	restart) cmd_stop || true; sleep 0.3; cmd_start ;;
+	status) cmd_status ;;
+	user_add) shift; cmd_user_add "$@" ;;
+	user_dell) shift; cmd_user_dell "$@" ;;
+	*) usage; exit 1 ;;
+esac
