@@ -61,7 +61,7 @@ usage — run as root from the pure-sshd directory
 
   1) sqlite3 present:
        sqlite3 --version
-  2) home must be a real directory /opt/hosting/clients/{kod}/site/{fqdn}
+  2) home must be a real directory /var/www/hosting/clients/{kod}/site/{fqdn}
   3) add a user (password prompted on TTY, or piped on stdin):
 
        etc/init.d/pure-sshd user_add ornek_site_com \
